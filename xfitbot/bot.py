@@ -213,7 +213,7 @@ async def main() -> None:
     if tts:
         await asyncio.to_thread(tts.warmup)
     if translator:
-        await asyncio.to_thread(translator.warmup)
+        await translator.warmup()
     else:
         log.info("Translator not installed: Tajik/Uzbek messages get Russian replies")
     me = await bot.get_me()

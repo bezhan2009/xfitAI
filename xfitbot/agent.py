@@ -71,11 +71,30 @@ LANG_NAMES = {"ru": "русский", "en": "английский (English)", "t
               "uz": "узбекский (o'zbek)", "zh": "китайский (中文)"}
 
 
+TAJIK_WORDS = {
+    "салом", "ассалому", "алейкум", "ташаккур", "рахмат", "ман", "шумо", "онхо",
+    "аст", "хаст", "нест", "чи", "чӣ", "чанд", "кадом", "кай", "куҷо", "кучо", "чаро", "барои", "бо", "дар", "аз",
+    "ба", "ки", "ва", "низ", "лутфан", "мумкин", "мехохам", "мехоҳам", "нарх", "нархи", "корт", "корти",
+    "точики", "тоҷикӣ", "точикия", "забони", "хуб", "бале", "имруз", "пагох", "соат",
+    "хона", "клуби", "дорам", "дорад", "доред", "кунед", "кунам", "гуфтед", "гуед", "медонед",
+    "мефахмед", "мефахми", "фахмидам", "намефахмам", "оилавӣ", "оилави", "кудак", "кӯдак", "писар", "духтар",
+}
+# Tajik present tense: ме- + stem + personal ending (мефахми, мехохам, мекунед, мешавад…)
+TAJIK_VERB_RE = re.compile(r"(на)?ме(фахм|хох|кун|шав|дон|бин|гир|ру|о|рав|диҳ|дих|гӯ|гу|хон|хӯр|хур|нав|пурс)"
+                           r"\w*(ам|ӣ|и|ад|ем|ед|анд|ид)")
+
+
 def user_language(text: str) -> str:
     if re.search(r"[一-鿿]", text):
         return "zh"
-    if re.search(r"[ғӣқӯҳҷҒӢҚӮҲҶ]", text) or re.search(r"\b(салом|ташаккур|чӣ|чанд|ман|шумо|ҳаст|аст)\b", text, re.I):
+    if re.search(r"[ғӣқӯҳҷҒӢҚӮҲҶ]", text):
         return "tg"
+    # Tajik typed without special letters (very common on phones): count Tajik-only words and verb forms
+    words = re.findall(r"[а-яё]+", text.lower())
+    if words:
+        tj = sum(1 for w in words if w in TAJIK_WORDS or TAJIK_VERB_RE.fullmatch(w))
+        if tj >= 2 or (tj >= 1 and len(words) <= 3):
+            return "tg"
     lat = len(re.findall(r"[A-Za-z]", text))
     cyr = len(re.findall(r"[А-Яа-яЁё]", text))
     if lat > cyr:
@@ -416,9 +435,15 @@ class Agent:
             if lang in settings.translate_languages and self.translator:
                 # the LLM can't write Tajik/Uzbek well: it reads and answers in Russian, the translator does the rest
                 original = text
-                text = await self.translator.translate(text, "ru")
-                log.info("translated %s->ru: %r -> %r", lang, original[:200], text[:200])
-                st.language, st.reply_lang, st.greet_salom = "ru", lang, False
+                # Tajik/Uzbek -> English is the translator's most accurate direction
+                en = await self.translator.translate(text, "en", source=lang)
+                text = (f"{original}\n[Перевод с {'таджикского' if lang == 'tg' else 'узбекского'} на английский: "
+                        f"«{en}»]")
+                log.info("translated %s->en: %r -> %r", lang, original[:200], en[:200])
+                if settings.translate_replies:
+                    st.language, st.reply_lang, st.greet_salom = "ru", lang, False
+                else:  # understand Tajik, answer in Russian (machine Tajik output is not always correct)
+                    st.language, st.reply_lang, st.greet_salom = "ru", "ru", True
             else:
                 # languages the model writes badly and we can't translate are answered in Russian
                 st.language = lang if lang in settings.reply_languages else "ru"
@@ -459,8 +484,9 @@ class Agent:
         if st.language != "ru":
             notes.append(f"Ответь на языке: {LANG_NAMES[st.language]}. Переведи справку на этот язык.")
         elif st.greet_salom:
-            notes.append("Клиент пишет по-таджикски/узбекски. Ответь по-русски, простыми словами; "
-                         "первое приветствие в диалоге начни с «Салом!».")
+            first_reply = not any(m["role"] == "assistant" for m in st.history)
+            notes.append("Клиент пишет по-таджикски/узбекски (перевод выше). Ответь по-русски, простыми словами. "
+                         + ("Начни ответ с «Салом!»." if first_reply else "Не здоровайся снова, «Салом» не пиши."))
         if notes:
             messages[-1] = {"role": "user", "content": text + "\n\n[" + "\n".join(notes) + "]"}
         handed_off = False

@@ -126,6 +126,10 @@ def speakable(text: str, lang: str = "ru") -> str:
         text = re.sub(r"\b(\d{4})-(\d{2})-(\d{2})\b",
                       lambda m: f"{int(m.group(3))} {MONTHS_RU[int(m.group(2)) - 1]} {m.group(1)} года"
                       if 1 <= int(m.group(2)) <= 12 else m.group(), text)
+        # ranges "9:00–21:00" / "(9:00-21:00)" -> "с девяти утра до девяти вечера"
+        text = re.sub(r"\(?\b(?:с\s+)?([01]?\d|2[0-3]):([0-5]\d)\s*(?:[–—-]|до)\s*([01]?\d|2[0-3]):([0-5]\d)\)?",
+                      lambda m: f"с {_time_words(int(m.group(1)), int(m.group(2)), 'ru', True)} "
+                                f"до {_time_words(int(m.group(3)), int(m.group(4)), 'ru', True)}", text)
         # time after "с/до/от/после/около" takes the genitive
         text = re.sub(r"\b(с|до|от|после|около)\s+([01]?\d|2[0-3]):([0-5]\d)\b",
                       lambda m: f"{m.group(1)} {_time_words(int(m.group(2)), int(m.group(3)), 'ru', True)}", text)

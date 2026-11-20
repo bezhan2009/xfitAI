@@ -35,9 +35,12 @@ class Settings:
     # languages the LLM may answer in; others get Russian (qwen2.5:7b can't write Tajik/Uzbek well)
     reply_languages: frozenset = frozenset(os.getenv("REPLY_LANGUAGES", "ru,en,zh").replace(" ", "").split(","))
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.4"))
-    # languages answered via the local translator (LLM answers in Russian, MADLAD-400 translates)
+    # languages answered via the local translator (LLM answers in Russian, TranslateGemma translates)
     translate_languages: frozenset = frozenset(os.getenv("TRANSLATE_LANGUAGES", "tg,uz").replace(" ", "").split(","))
-    mt_threads: int = int(os.getenv("MT_THREADS", "6"))
+    mt_model: str = os.getenv("MT_MODEL", "translategemma:4b")
+    # true: answer Tajik/Uzbek clients in their language (machine translation); false: understand them, answer in Russian
+    translate_replies: bool = _bool("TRANSLATE_REPLIES", False)
+    mt_num_gpu: int = int(os.getenv("MT_NUM_GPU", "0"))  # 0 = CPU, keeps the main LLM on the GPU
 
     tts_enabled: bool = _bool("TTS_ENABLED", True)
     tts_engine: str = os.getenv("TTS_ENGINE", "silero")  # silero | chatterbox
