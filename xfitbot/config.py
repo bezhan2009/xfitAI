@@ -31,17 +31,23 @@ class Settings:
     onec_password: str = os.getenv("ONEC_PASSWORD", "")
 
     ollama_url: str = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-    llm_model: str = os.getenv("LLM_MODEL", "qwen3:4b-instruct-2507-q4_K_M")
+    llm_model: str = os.getenv("LLM_MODEL", "qwen2.5:7b")
+    # languages the LLM may answer in; others get Russian (qwen2.5:7b can't write Tajik/Uzbek well)
+    reply_languages: frozenset = frozenset(os.getenv("REPLY_LANGUAGES", "ru,en,zh").replace(" ", "").split(","))
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.4"))
 
     tts_enabled: bool = _bool("TTS_ENABLED", True)
+    tts_engine: str = os.getenv("TTS_ENGINE", "silero")  # silero | chatterbox
+    tts_speaker_ru: str = os.getenv("TTS_SPEAKER_RU", "ru_xenia")
+    tts_speaker_tg: str = os.getenv("TTS_SPEAKER_TG", "tgk_onaoy")
+    tts_speaker_uz: str = os.getenv("TTS_SPEAKER_UZ", "uzb_saida")
     tts_voice_ref: str = os.getenv("TTS_VOICE_REF", "")  # optional wav of a real voice (with consent)
     tts_device: str = os.getenv("TTS_DEVICE", "cuda")
     tts_exaggeration: float = float(os.getenv("TTS_EXAGGERATION", "0.55"))
     tts_cfg_weight: float = float(os.getenv("TTS_CFG_WEIGHT", "0.45"))
 
     stt_enabled: bool = _bool("STT_ENABLED", True)
-    stt_model: str = os.getenv("STT_MODEL", "large-v3-turbo")
+    stt_model: str = os.getenv("STT_MODEL", "small")
     stt_device: str = os.getenv("STT_DEVICE", "cpu")
 
     data_dir: Path = ROOT / "data"

@@ -6,12 +6,16 @@ then as a separate **voice message** with a natural human voice.
 
 Everything runs on the local machine (GPU): no OpenAI or other cloud APIs.
 
-| Part | Model / library | License | Why |
+| Part | Model / library | License | Notes |
 |---|---|---|---|
-| Answers + tool calling | [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) via [Ollama](https://ollama.com) (Q4_K_M, ~2.6 GB VRAM) | Apache-2.0 | Best Russian tool-calling score among small Qwen3 models in an independent Habr test; fits a 6 GB GPU next to TTS |
-| Voice replies (TTS) | [Chatterbox Multilingual](https://huggingface.co/ResembleAI/chatterbox) | MIT | Russian/English/Chinese, emotion control, optional voice cloning from a short sample; commercial use allowed |
-| Incoming voice notes (STT) | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) `large-v3-turbo` | MIT | Accurate Russian/Tajik/English recognition, runs on CPU (int8) to leave the GPU for LLM + TTS |
+| Answers + tool calling | **qwen2.5:7b** (Q4_K_M) via [Ollama](https://ollama.com), already installed on this PC | Apache-2.0 | GPU. Good Russian/English, follows facts placed next to the question. Can't write Tajik/Uzbek well, so those messages get a Russian reply (see `REPLY_LANGUAGES`) |
+| Voice replies (TTS) | [Silero v5 CIS](https://github.com/snakers4/silero-models) `v5_cis_base_nostress` + [silero-stress](https://github.com/snakers4/silero-stress) | MIT | CPU, ~90 MB. Female voices: Russian `ru_xenia`, Tajik `tgk_onaoy`, Uzbek `uzb_saida` |
+| Voice replies, other languages (optional) | [Chatterbox Multilingual](https://huggingface.co/ResembleAI/chatterbox) | MIT | GPU, ~3 GB + CUDA PyTorch. Used for English/Chinese if installed, or for everything with `TTS_ENGINE=chatterbox`; can clone a real voice |
+| Incoming voice notes (STT) | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) `small` | MIT | CPU int8. Use `large-v3-turbo` for better Tajik if disk allows |
 | Telegram | aiogram 3 | MIT | |
+
+Upgrade path when there is ~15 GB free disk: `ollama pull qwen3:4b-instruct-2507-q4_K_M` (or a Russian-tuned 7-8B),
+CUDA PyTorch + `pip install chatterbox-tts`, `STT_MODEL=large-v3-turbo`.
 
 ## What it does
 
@@ -50,22 +54,20 @@ cards are not looked up. The test base (`Fitness_test`) is a snapshot whose late
 
 ## Setup (Windows, NVIDIA GPU)
 
-Disk: ~15 GB free (PyTorch+CUDA ~5 GB, Qwen ~2.6 GB, Chatterbox ~3 GB, Whisper ~1.6 GB).
-
 ```powershell
-# 1. Ollama + model
-#    install from https://ollama.com/download, then:
-ollama pull qwen3:4b-instruct-2507-q4_K_M
+# 1. Ollama with the model (on this PC the models live in D:\RelocatedData\Ollama\models)
+$env:OLLAMA_MODELS = "D:\RelocatedData\Ollama\models"; ollama serve
+ollama pull qwen2.5:7b        # only if not installed yet
 
 # 2. Python 3.11 venv
 py -3.11 -m venv .venv
-.venv\Scripts\python -m pip install torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+.venv\Scripts\python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 .venv\Scripts\python -m pip install -r requirements.txt
 
 # 3. Config
 copy .env.example .env   # fill TELEGRAM_TOKEN, ONEC_*, ADMIN_IDS, MANAGER_CHAT_ID
 
-# 4. Run
+# 4. Run (the Silero model downloads to models/ on first start)
 .venv\Scripts\python run.py
 ```
 
@@ -88,7 +90,7 @@ run.py                 entry point
 xfitbot/config.py      settings from .env
 xfitbot/onec.py        read-only 1C OData client (clients, memberships, sales stats)
 xfitbot/agent.py       LLM agent: system prompt, tools, history, spoken rewrite
-xfitbot/voice.py       TTS (Chatterbox) + STT (faster-whisper), OGG/Opus encoding
+xfitbot/voice.py       TTS (Silero / Chatterbox) + STT (faster-whisper), OGG/Opus encoding
 xfitbot/bot.py         Telegram handlers
 xfitbot/knowledge.md   club knowledge base (edit to add facts)
 data/                  plans.json (optional tariff names), users.json (verified phones, not in git)

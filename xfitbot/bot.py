@@ -111,7 +111,7 @@ async def on_reset(message: Message) -> None:
 @dp.message(Command("forget"))
 async def on_forget(message: Message) -> None:
     st = store.get(message.from_user.id)
-    st.phone = st.client_key = st.client_name = None
+    st.phone = st.client_key = st.client_name = st.client_data = None
     st.history.clear()
     store.save(st)
     await message.answer("Удалила ваш номер из бота. Чтобы снова посмотреть карту, поделитесь номером.",
@@ -135,8 +135,8 @@ async def on_contact(message: Message) -> None:
             return
     await message.answer("Спасибо, номер получила ✅", reply_markup=ReplyKeyboardRemove())
     prompt = ("[Системное событие: клиент только что подтвердил номер. "
-              + ("Он найден в 1С — коротко поприветствуй по имени и посмотри его карты через get_my_memberships, "
-                 "кратко скажи главное.]" if res == "found" else
+              + ("Он найден в 1С — коротко поприветствуй по имени и одним-двумя предложениями скажи главное "
+                 "по его картам из блока ДАННЫЕ КЛИЕНТА ИЗ 1С (есть ли действующая и до какого числа).]" if res == "found" else
                  "В 1С его нет — значит, он у нас новенький. Тепло скажи об этом и спроси, что его интересует.]"))
     await answer(message, prompt)
 
