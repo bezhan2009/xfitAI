@@ -132,6 +132,7 @@ def tidy_answer(answer: str, st: "UserState") -> str:
         before = answer[: m.start()]
         if st.client_key or "?" in before:
             answer = before.rstrip()
+    answer = re.sub(r"(?i)(?<=\w)assistant\s*:\s*", "", answer)  # stray role token glued into text by the model
     return re.sub(r"\n{3,}", "\n\n", answer).strip()
 
 
@@ -326,7 +327,11 @@ class Agent:
     def _system(self, st: UserState, is_staff: bool, client_data: str) -> str:
         now = datetime.now(ZoneInfo(settings.timezone))
         today = f"{WEEKDAYS[now.weekday()]}, {now.day} {MONTHS[now.month - 1]} {now.year}, {now:%H:%M} ({now.date().isoformat()})"
-        if st.client_key:
+        if is_staff:
+            client = (f"сотрудник клуба ({st.first_name or 'без имени'}). Телефоны, которые он пишет, — это номера "
+                      "клиентов для поиска, а не его собственный номер.")
+            client_data = ""
+        elif st.client_key:
             client = f"номер подтверждён, найден в 1С: {st.client_name}."
         elif st.phone:
             client = "номер подтверждён, но в 1С клиента с таким номером нет (новый клиент, данных о карте нет)."
@@ -384,6 +389,7 @@ class Agent:
         if phone:  # deterministic 1C lookup: small models skip tool calls too often
             if is_staff:
                 found = _humanize(await self._run_tool(st, "staff_find_client", {"query": phone}, True))
+                log.info("staff phone lookup +%s -> %s", phone, str(found)[:300])
                 notes.append(f"Поиск в 1С по номеру +{phone} (режим сотрудника): "
                              f"{json.dumps(found, ensure_ascii=False, default=str)}")
             else:
