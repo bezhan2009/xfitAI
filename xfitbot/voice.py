@@ -97,11 +97,12 @@ class SileroEngine:
                 log.info("Downloading Silero TTS model…")
                 torch.hub.download_url_to_file(SILERO_URL, str(SILERO_PATH))
             torch.set_num_threads(4)
-            self._model = torch.package.PackageImporter(str(SILERO_PATH)).load_pickle("tts_models", "model")
-            self._model.to(torch.device("cpu"))
+            model = torch.package.PackageImporter(str(SILERO_PATH)).load_pickle("tts_models", "model")
+            model.to(torch.device("cpu"))
             from silero_stress import load_accentor
 
             self._accentor = load_accentor()
+            self._model = model  # set last, so a failed load is retried next time
             log.info("Silero TTS loaded")
         return self._model
 

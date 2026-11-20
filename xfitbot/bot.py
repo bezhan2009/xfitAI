@@ -50,8 +50,25 @@ async def notify_manager(st: UserState, reason: str, summary: str) -> None:
 agent = Agent(onec, store, notify_manager)
 
 
+_client_view: set[int] = set()  # admins who switched to the customer view with /mode
+
+
 def is_staff(user_id: int) -> bool:
-    return user_id in settings.admin_ids
+    return user_id in settings.admin_ids and user_id not in _client_view
+
+
+@dp.message(Command("mode"))
+async def on_mode(message: Message) -> None:
+    uid = message.from_user.id
+    if uid not in settings.admin_ids:
+        return
+    if uid in _client_view:
+        _client_view.discard(uid)
+        await message.answer("Режим сотрудника: доступна аналитика 1С (продажи, новые клиенты, поиск клиента).")
+    else:
+        _client_view.add(uid)
+        await message.answer("Режим клиента: бот отвечает вам как обычному клиенту. /mode — вернуться.")
+    store.get(uid).history.clear()
 
 
 async def human_pause(text: str) -> None:
@@ -67,6 +84,7 @@ async def answer(message: Message, user_text: str) -> None:
         async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
             try:
                 reply = await agent.reply(st, user_text, is_staff(uid))
+                log.info("dialog %s | Q: %s | A: %s", uid, user_text[:300].replace("\n", " "), reply.replace("\n", " "))
             except Exception:  # noqa: BLE001
                 log.exception("agent failed")
                 await message.answer("Ой, у меня небольшая техническая заминка. Напишите, пожалуйста, ещё раз через минуту 🙏")

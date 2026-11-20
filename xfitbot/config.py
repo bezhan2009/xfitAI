@@ -38,7 +38,7 @@ class Settings:
 
     tts_enabled: bool = _bool("TTS_ENABLED", True)
     tts_engine: str = os.getenv("TTS_ENGINE", "silero")  # silero | chatterbox
-    tts_speaker_ru: str = os.getenv("TTS_SPEAKER_RU", "ru_xenia")
+    tts_speaker_ru: str = os.getenv("TTS_SPEAKER_RU", "ru_ekaterina")
     tts_speaker_tg: str = os.getenv("TTS_SPEAKER_TG", "tgk_onaoy")
     tts_speaker_uz: str = os.getenv("TTS_SPEAKER_UZ", "uzb_saida")
     tts_voice_ref: str = os.getenv("TTS_VOICE_REF", "")  # optional wav of a real voice (with consent)

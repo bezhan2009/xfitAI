@@ -159,11 +159,13 @@ class OneC:
             CLIENTS, select=sel, top="10",
             filter=f"КонтактнаяИнформация/any(d: d/НомерТелефона eq '{norm}')",
         )
-        if not rows and norm.startswith("992"):
-            rows = await self._list(
-                CLIENTS, select=sel, top="10",
-                filter=f"КонтактнаяИнформация/any(d: d/НомерТелефонаБезКодов eq '{norm[3:]}')",
-            )
+        # 1C stores numbers inconsistently ("992XXXXXXXXX", "XXXXXXXXX", "+992 XX…"), so fall back step by step
+        for flt in (f"КонтактнаяИнформация/any(d: d/НомерТелефонаБезКодов eq '{norm[3:]}')",
+                    f"КонтактнаяИнформация/any(d: d/НомерТелефонаБезКодов eq '{norm}')",
+                    f"substringof('{norm[-9:]}', Телефон) eq true"):
+            if rows:
+                break
+            rows = await self._list(CLIENTS, select=sel, top="10", filter=flt)
         return [r for r in rows if not r.get("DeletionMark")]
 
     async def search_clients_by_name(self, text: str, limit: int = 10) -> list[dict]:

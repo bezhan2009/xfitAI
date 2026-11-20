@@ -36,7 +36,8 @@ SYSTEM_PROMPT = """Ты — Алина, ассистент фитнес-клуб
 
 Правила по данным:
 - Отвечай ТОЛЬКО по базе знаний и по блоку «ДАННЫЕ КЛИЕНТА ИЗ 1С». Ничего не выдумывай: ни цен, ни дат, ни тарифов, ни акций, ни расписания, ни условий. Если в данных чего-то нет — так и скажи и предложи уточнить у менеджера.
-- Про абонемент клиента говори только то, что есть в блоке «ДАННЫЕ КЛИЕНТА ИЗ 1С». Если блока нет — у тебя НЕТ данных о его карте: попроси нажать кнопку «📱 Поделиться номером» под сообщением. Номер, написанный текстом, не подходит.
+- Про абонемент клиента говори только то, что есть в блоке «ДАННЫЕ КЛИЕНТА ИЗ 1С». Если блока нет — у тебя НЕТ данных о его карте: попроси написать номер телефона, на который оформлена карта (+992…), или нажать кнопку «📱 Поделиться номером».
+- Поиск по номеру делает система, результат придёт в пометке [Поиск в 1С …]. НИКОГДА не говори, что клиента нет в базе, если такой пометки нет.
 - Заморозка: возможна только в пределах «дней_заморозки_по_тарифу». Если там 0 — по тарифу заморозка не предусмотрена. Саму заморозку, продление, переоформление, запись на тур оформляет менеджер, не ты.
 - Тур: когда клиент назвал день и примерное время (с 9:00 до 21:00) — вызови handoff_to_manager с summary и скажи, что передала менеджеру, он подтвердит время в этом чате. Если назвал только день — спроси время двумя вариантами.
 - Жалоба, возврат, скидка, мед. вопрос, просьба позвать человека, нет ответа в базе — вызови handoff_to_manager.
@@ -57,8 +58,9 @@ SYSTEM_PROMPT = """Ты — Алина, ассистент фитнес-клуб
 """
 
 STAFF_NOTE = """Собеседник — сотрудник клуба (режим персонала). Ему можно отвечать на аналитические вопросы по 1С \
-(продажи, новые клиенты, поиск клиента по телефону или ФИО) через инструменты staff_*. Отвечай точно цифрами, \
-кратко, можно списком."""
+(продажи, новые клиенты, поиск клиента по телефону или ФИО) через инструменты staff_*. Если сотрудник называет ФИО \
+или фамилию — обязательно вызови staff_find_client. Поиск по телефону система делает сама (пометка [Поиск в 1С …]). \
+Отвечай точно цифрами, кратко, можно списком. Правила про тур и вопрос «сегодня или завтра» к сотруднику не применяй."""
 
 
 HANDOFF_RE = re.compile(r"(передала|передаю|уже передал|менеджер (свяжется|подтвердит|подключится|ответит)|"
@@ -80,6 +82,18 @@ def user_language(text: str) -> str:
             return "uz"
         return "en"
     return "ru"
+
+
+PHONE_RUN_RE = re.compile(r"\+?\d[\d\s\-()]{7,20}\d")
+
+
+def find_phone(text: str) -> str | None:
+    """First phone-like number in a message (9 local or 12 digits with 992), normalised to 992XXXXXXXXX."""
+    for m in PHONE_RUN_RE.finditer(text):
+        digits = re.sub(r"\D", "", m.group())
+        if len(digits) == 9 or (len(digits) == 12 and digits.startswith("992")):
+            return normalize_phone(digits)
+    return None
 
 
 def _kb_sections() -> list[tuple[str, str]]:
@@ -281,7 +295,12 @@ class Agent:
                 for c in found[:5]:
                     out.append({"ФИО": c["Description"], "зарегистрирован": (c.get("ДатаРегистрации") or "")[:10],
                                 "абонементы": (await self.onec.memberships(c["Ref_Key"]))[:5]})
-                return {"найдено": len(found), "клиенты": out}
+                if not found:
+                    return {"результат": f"по запросу «{q}» в 1С клиентов НЕ найдено"}
+                for c in out:
+                    if not c["абонементы"]:
+                        c["абонементы"] = "абонементов в 1С НЕТ (ни одного)"
+                return {"результат": f"НАЙДЕНО клиентов: {len(found)}", "клиенты": out}
         except Exception as e:  # noqa: BLE001
             log.exception("tool %s failed", name)
             return {"ошибка": f"1С сейчас недоступна или вернула ошибку ({type(e).__name__}). Скажи, что уточнишь позже."}
@@ -295,7 +314,8 @@ class Agent:
         if st.client_data is None or time.time() - st.client_data_at > 300:
             try:
                 ms = await self.onec.memberships(st.client_key)
-                data = {"имя_в_1С": st.client_name, "всего_абонементов": len(ms), "абонементы_последние": ms[:5]}
+                data = {"имя_в_1С": st.client_name, "всего_абонементов": len(ms),
+                        "абонементы_последние": ms[:5] if ms else "у клиента в 1С НЕТ ни одного абонемента"}
                 st.client_data = json.dumps(_humanize(data), ensure_ascii=False, default=str)
                 st.client_data_at = time.time()
             except Exception:  # noqa: BLE001
@@ -359,8 +379,31 @@ class Agent:
         st.history[:] = st.history[-MAX_HISTORY:]
         client_data = await self._client_block(st)
         messages = [{"role": "system", "content": self._system(st, is_staff, client_data)}, *st.history]
-        facts = relevant_facts(text)
         notes = []
+        phone = find_phone(text)
+        if phone:  # deterministic 1C lookup: small models skip tool calls too often
+            if is_staff:
+                found = _humanize(await self._run_tool(st, "staff_find_client", {"query": phone}, True))
+                notes.append(f"Поиск в 1С по номеру +{phone} (режим сотрудника): "
+                             f"{json.dumps(found, ensure_ascii=False, default=str)}")
+            else:
+                try:
+                    res = await self.verify_contact(st, phone)
+                except Exception:  # noqa: BLE001
+                    log.exception("1C phone lookup failed")
+                    res = "error"
+                if res == "found":
+                    client_data = await self._client_block(st)
+                    messages[0] = {"role": "system", "content": self._system(st, is_staff, client_data)}
+                    notes.append(f"Поиск в 1С по номеру +{phone}: клиент НАЙДЕН ({st.client_name}). "
+                                 "Его карты — в блоке ДАННЫЕ КЛИЕНТА ИЗ 1С. Не называй полное ФИО, только имя.")
+                elif res == "not_found":
+                    notes.append(f"Поиск в 1С по номеру +{phone}: клиента с таким номером НЕТ. "
+                                 "Предложи проверить номер или нажать кнопку «📱 Поделиться номером»; "
+                                 "если клиент уверен — передай менеджеру.")
+                else:
+                    notes.append("Поиск в 1С: база сейчас недоступна, скажи, что проверишь позже.")
+        facts = relevant_facts(text)
         if facts:  # small models follow facts placed next to the question much better than a long system prompt
             notes.append(f"Справка из базы знаний — используй дословно, не меняй цифры:\n{facts}")
         if st.language != "ru":
@@ -395,6 +438,13 @@ class Agent:
             answer = "Секунду, уточню у менеджера и вернусь с ответом."
         if not answer:
             answer = "Извините, не совсем поняла. Можете переформулировать?"
+        if st.language != "zh" and re.search(r"[\u4e00-\u9fff]", answer):
+            log.warning("model drifted into Chinese, retrying")
+            messages.append({"role": "assistant", "content": answer})
+            messages.append({"role": "user", "content": f"[Ты перешла на китайский. Перепиши ответ полностью на языке: "
+                                                        f"{LANG_NAMES.get(st.language, 'русский')}, без китайских символов.]"})
+            answer = ((await self._chat(messages, []))).get("content", "").strip() or answer
+            answer = re.sub(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]+", "", answer).strip()
         answer = tidy_answer(answer, st)
         st.history.append({"role": "assistant", "content": answer})
         if not handed_off and self.notify_manager and HANDOFF_RE.search(answer):

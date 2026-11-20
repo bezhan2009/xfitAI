@@ -9,7 +9,7 @@ Everything runs on the local machine (GPU): no OpenAI or other cloud APIs.
 | Part | Model / library | License | Notes |
 |---|---|---|---|
 | Answers + tool calling | **qwen2.5:7b** (Q4_K_M) via [Ollama](https://ollama.com), already installed on this PC | Apache-2.0 | GPU. Good Russian/English, follows facts placed next to the question. Can't write Tajik/Uzbek well, so those messages get a Russian reply (see `REPLY_LANGUAGES`) |
-| Voice replies (TTS) | [Silero v5 CIS](https://github.com/snakers4/silero-models) `v5_cis_base_nostress` + [silero-stress](https://github.com/snakers4/silero-stress) | MIT | CPU, ~90 MB. Female voices: Russian `ru_xenia`, Tajik `tgk_onaoy`, Uzbek `uzb_saida` |
+| Voice replies (TTS) | [Silero v5 CIS](https://github.com/snakers4/silero-models) `v5_cis_base_nostress` + [silero-stress](https://github.com/snakers4/silero-stress) | MIT | CPU, ~90 MB. Female voices: Russian `ru_ekaterina`, Tajik `tgk_onaoy`, Uzbek `uzb_saida` |
 | Voice replies, other languages (optional) | [Chatterbox Multilingual](https://huggingface.co/ResembleAI/chatterbox) | MIT | GPU, ~3 GB + CUDA PyTorch. Used for English/Chinese if installed, or for everything with `TTS_ENGINE=chatterbox`; can clone a real voice |
 | Incoming voice notes (STT) | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) `small` | MIT | CPU int8. Use `large-v3-turbo` for better Tajik if disk allows |
 | Telegram | aiogram 3 | MIT | |
@@ -82,7 +82,7 @@ with *409 Conflict* until that webhook is removed. Removing it disconnects the o
 - `TTS_ENABLED=false` / `STT_ENABLED=false`: text-only mode.
 
 ### Bot commands
-`/start`, `/reset` (clear conversation), `/forget` (remove stored phone).
+`/start`, `/reset` (clear conversation), `/forget` (remove stored phone), `/mode` (admins: switch staff / customer view).
 
 ## Layout
 ```

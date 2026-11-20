@@ -12,3 +12,4 @@ data/voice_cache/
 models/
 data/test_users.json
 scratch_*.py
+voice_samples/
