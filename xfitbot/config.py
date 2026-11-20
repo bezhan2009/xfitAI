@@ -35,6 +35,9 @@ class Settings:
     # languages the LLM may answer in; others get Russian (qwen2.5:7b can't write Tajik/Uzbek well)
     reply_languages: frozenset = frozenset(os.getenv("REPLY_LANGUAGES", "ru,en,zh").replace(" ", "").split(","))
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.4"))
+    # languages answered via the local translator (LLM answers in Russian, MADLAD-400 translates)
+    translate_languages: frozenset = frozenset(os.getenv("TRANSLATE_LANGUAGES", "tg,uz").replace(" ", "").split(","))
+    mt_threads: int = int(os.getenv("MT_THREADS", "6"))
 
     tts_enabled: bool = _bool("TTS_ENABLED", True)
     tts_engine: str = os.getenv("TTS_ENGINE", "silero")  # silero | chatterbox

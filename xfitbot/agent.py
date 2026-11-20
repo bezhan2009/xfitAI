@@ -15,6 +15,7 @@ import httpx
 
 from .config import settings
 from .onec import OneC, normalize_phone
+from .speech_text import EMOTIONS, heuristic_emotions, speakable
 
 log = logging.getLogger(__name__)
 
@@ -188,6 +189,7 @@ class UserState:
     history: list[dict] = field(default_factory=list)
     language: str = "ru"
     greet_salom: bool = False
+    reply_lang: str = "ru"  # language of the text actually sent to the user
     client_data: str | None = None
     client_data_at: float = 0.0
 
@@ -248,8 +250,10 @@ STAFF_TOOLS = [
 
 class Agent:
     def __init__(self, onec: OneC, store: UserStore,
-                 notify_manager: Callable[[UserState, str, str], Awaitable[None]] | None = None) -> None:
+                 notify_manager: Callable[[UserState, str, str], Awaitable[None]] | None = None,
+                 translator: Any = None) -> None:
         self.onec = onec
+        self.translator = translator
         self.store = store
         self.notify_manager = notify_manager
         self.http = httpx.AsyncClient(base_url=settings.ollama_url, timeout=httpx.Timeout(300, connect=10))
@@ -350,36 +354,76 @@ class Agent:
         r.raise_for_status()
         return r.json()["message"]
 
-    async def spoken_version(self, text: str) -> str:
-        """Rewrite a chat reply so it sounds natural when read aloud by TTS."""
+    async def spoken_version(self, text: str, lang: str = "ru") -> list[tuple[str, str]]:
+        """Turn a chat reply into voice segments [(emotion, sentence)].
+
+        The sentences themselves come from a deterministic converter (numbers, dates, phones, links, brand
+        names -> words), so facts can't change. The LLM only picks an emotion per sentence and may add a
+        short interjection («Ой,», «Так,») to make it sound like a real person.
+        """
+        base = speakable(text, lang)
+        if not base:
+            return []
+        segments = heuristic_emotions(base)
+        if lang != "ru" or len(segments) > 12:
+            return segments
+        numbered = "\n".join(f"{i + 1}. {s}" for i, (_, s) in enumerate(segments))
         prompt = (
-            "Перепиши сообщение так, как его произнёс бы вслух живой администратор фитнес-клуба в голосовом "
-            "сообщении. Правила: тот же язык и тот же смысл, ничего не добавляй по фактам; все числа, даты, время, "
-            "проценты и телефоны напиши словами в правильном падеже (например «до седьмого октября», «десять процентов»); "
-            "время уже записано словами — НЕ меняй его значение, можно только поправить падеж; ссылки не читай — скажи «ссылку я прислала в сообщении»; "
-            "убери эмодзи и спецсимволы; можно добавить лёгкие разговорные связки («так», «смотрите»), но коротко. "
-            "Верни только текст для озвучки.\n\nСообщение:\n" + times_to_words(text)
+            "Ты режиссёр озвучки. Алина — живой, тёплый администратор фитнес-клуба — записывает голосовое сообщение. "
+            "Для КАЖДОГО предложения выбери эмоцию: радость, воодушевление, тепло, сочувствие, вопрос, спокойно. "
+            "Вопросы — вопрос. Плохие новости (истекла, нельзя, к сожалению) — сочувствие. Приветствие и хорошие "
+            "новости — радость. Можно добавить короткое междометие в начало предложения («Ой,», «Так,», «Смотрите,», "
+            "«Ага,», «Ну что ж,», «Хм,») — не больше двух на всё сообщение и только там, где это звучит естественно.\n"
+            "Формат ответа — по строке на предложение: номер | эмоция | междометие или -\n"
+            "Пример:\n1 | радость | Ой,\n2 | сочувствие | -\n3 | вопрос | -\n\n"
+            f"Предложения:\n{numbered}"
         )
         try:
             r = await self.http.post("/api/chat", json={
                 "model": settings.llm_model, "stream": False, "keep_alive": "60m",
                 "messages": [{"role": "user", "content": prompt}],
-                "options": {"temperature": 0.3, "num_ctx": 4096},
+                "options": {"temperature": 0.4, "num_ctx": 4096},
             })
             r.raise_for_status()
-            out = (r.json()["message"].get("content") or "").strip().strip('"«»')
-            return out or text
+            out = r.json()["message"].get("content") or ""
         except Exception:  # noqa: BLE001
-            log.exception("spoken rewrite failed, using raw text")
-            return text
+            log.exception("emotion tagging failed, using heuristics")
+            return segments
+        result = list(segments)
+        interjections = 0
+        for line in out.splitlines():
+            m = re.match(r"\s*(\d+)\s*[|.)]\s*([а-яё]+)\s*(?:\|\s*(.*))?$", line.strip(), re.I)
+            if not m or not 1 <= int(m.group(1)) <= len(segments):
+                continue
+            i = int(m.group(1)) - 1
+            emotion = m.group(2).lower()
+            sentence = segments[i][1]
+            if emotion not in EMOTIONS or sentence.endswith("?"):
+                emotion = segments[i][0]
+            prefix = (m.group(3) or "").strip().strip("-").strip()
+            if (prefix and interjections < 2 and len(prefix) <= 14 and not re.search(r"[\d\[\]]", prefix)
+                    and not sentence.lower().startswith(prefix.lower().rstrip(",…").strip())):
+                interjections += 1
+                prefix = prefix.rstrip(",.…") + ("…" if prefix.lower().startswith(("хм", "ну")) else ",")
+                sentence = f"{prefix} {sentence}"  # the voice ignores letter case
+            result[i] = (emotion, sentence)
+        return result
 
-    async def reply(self, st: UserState, text: str, is_staff: bool = False) -> str:
+    async def reply(self, st: UserState, text: str, is_staff: bool = False, lang_hint: str | None = None) -> str:
         tools = CLIENT_TOOLS + (STAFF_TOOLS if is_staff else [])
         if not text.startswith("[Системное"):
-            lang = user_language(text)
-            # languages the local model writes badly (e.g. Tajik for qwen2.5:7b) are answered in Russian
-            st.language = lang if lang in settings.reply_languages else "ru"
-            st.greet_salom = lang in ("tg", "uz")
+            lang = lang_hint if lang_hint in LANG_NAMES else user_language(text)
+            if lang in settings.translate_languages and self.translator:
+                # the LLM can't write Tajik/Uzbek well: it reads and answers in Russian, the translator does the rest
+                original = text
+                text = await self.translator.translate(text, "ru")
+                log.info("translated %s->ru: %r -> %r", lang, original[:200], text[:200])
+                st.language, st.reply_lang, st.greet_salom = "ru", lang, False
+            else:
+                # languages the model writes badly and we can't translate are answered in Russian
+                st.language = lang if lang in settings.reply_languages else "ru"
+                st.reply_lang = st.language
+                st.greet_salom = lang in ("tg", "uz")
         st.history.append({"role": "user", "content": text})
         st.history[:] = st.history[-MAX_HISTORY:]
         client_data = await self._client_block(st)
@@ -458,4 +502,12 @@ class Agent:
             convo = "\n".join(f"{'Клиент' if m['role'] == 'user' else 'Алина'}: {m['content']}"
                               for m in st.history[-6:] if not m["content"].startswith("[Системное"))
             await self.notify_manager(st, "ассистент передал диалог", convo)
+        if st.reply_lang in settings.translate_languages and self.translator and st.reply_lang != st.language:
+            try:
+                translated = await self.translator.translate(answer, st.reply_lang)
+                log.info("translated ru->%s: %r", st.reply_lang, translated[:300])
+                return translated or answer
+            except Exception:  # noqa: BLE001
+                log.exception("translation of the answer failed, sending Russian")
+                st.reply_lang = "ru"
         return answer

@@ -15,6 +15,7 @@ from aiogram.utils.chat_action import ChatActionSender
 from .agent import Agent, UserState, UserStore
 from .config import settings
 from .onec import OneC
+from .translate import Translator
 from .voice import STT, TTS
 
 log = logging.getLogger(__name__)
@@ -28,6 +29,9 @@ onec = OneC()
 store = UserStore(settings.data_dir / "users.json")
 tts = TTS() if settings.tts_enabled else None
 stt = STT() if settings.stt_enabled else None
+translator = Translator() if settings.translate_languages and Translator.available() else None
+AUDIO_EXT = (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav", ".aac", ".amr", ".flac", ".webm", ".wma", ".3gp")
+MAX_AUDIO_SECONDS = 300
 bot = Bot(settings.telegram_token)
 dp = Dispatcher()
 _user_locks: dict[int, asyncio.Lock] = {}
@@ -47,7 +51,7 @@ async def notify_manager(st: UserState, reason: str, summary: str) -> None:
         log.exception("could not notify manager chat")
 
 
-agent = Agent(onec, store, notify_manager)
+agent = Agent(onec, store, notify_manager, translator)
 
 
 _client_view: set[int] = set()  # admins who switched to the customer view with /mode
@@ -76,14 +80,14 @@ async def human_pause(text: str) -> None:
     await asyncio.sleep(min(0.6 + len(text) / 90, 3.0) + random.uniform(0, 0.5))
 
 
-async def answer(message: Message, user_text: str) -> None:
+async def answer(message: Message, user_text: str, lang_hint: str | None = None) -> None:
     uid = message.from_user.id
     st = store.get(uid, message.from_user.first_name or "")
     lock = _user_locks.setdefault(uid, asyncio.Lock())
     async with lock:
         async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
             try:
-                reply = await agent.reply(st, user_text, is_staff(uid))
+                reply = await agent.reply(st, user_text, is_staff(uid), lang_hint)
                 log.info("dialog %s | Q: %s | A: %s", uid, user_text[:300].replace("\n", " "), reply.replace("\n", " "))
             except Exception:  # noqa: BLE001
                 log.exception("agent failed")
@@ -93,14 +97,18 @@ async def answer(message: Message, user_text: str) -> None:
         kb = SHARE_KB if not st.phone and "Поделиться номером" in reply else None
         await message.answer(reply, reply_markup=kb, disable_web_page_preview=True)
         if tts:
-            asyncio.create_task(send_voice(message, reply))
+            asyncio.create_task(send_voice(message, reply, st.reply_lang))
 
 
-async def send_voice(message: Message, reply: str) -> None:
+async def send_voice(message: Message, reply: str, lang: str = "ru") -> None:
+    if not tts.supports(lang):
+        log.info("no voice for language %s", lang)
+        return
     try:
         async with ChatActionSender.record_voice(bot=bot, chat_id=message.chat.id):
-            spoken = await agent.spoken_version(reply)
-            audio = await tts.synthesize(spoken)
+            segments = await agent.spoken_version(reply, lang)
+            log.info("voice %s: %s", lang, " | ".join(f"[{e}] {t}" for e, t in segments)[:500])
+            audio = await tts.synthesize(segments, lang)
         if audio:
             await message.answer_voice(BufferedInputFile(audio, filename="reply.ogg"))
     except Exception:  # noqa: BLE001
@@ -159,24 +167,32 @@ async def on_contact(message: Message) -> None:
     await answer(message, prompt)
 
 
-@dp.message(F.voice | F.audio | F.video_note)
+@dp.message(F.voice | F.audio | F.video_note | F.document.func(lambda d: d is not None and ((d.mime_type or "").startswith("audio/")
+                                                               or (d.file_name or "").lower().endswith(AUDIO_EXT))))
 async def on_voice(message: Message) -> None:
+    """Voice notes, round videos and audio files (also sent as attachments): transcribe and answer them."""
     if not stt:
         await message.answer("Голосовые пока не слушаю — напишите, пожалуйста, текстом 🙏")
         return
-    media = message.voice or message.audio or message.video_note
+    media = message.voice or message.audio or message.video_note or message.document
+    duration = getattr(media, "duration", None) or 0
+    if duration > MAX_AUDIO_SECONDS:
+        await message.answer("Ой, запись очень длинная 🙈 Можете коротко сказать или написать, что вас интересует?")
+        return
     async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
         buf = await bot.download(media)
         try:
-            text = await stt.transcribe(buf.read())
+            text, lang = await stt.transcribe(buf.read())
         except Exception:  # noqa: BLE001
             log.exception("transcription failed")
-            text = ""
+            text, lang = "", ""
     if not text:
         await message.answer("Не расслышала 🙈 Можете повторить или написать текстом?")
         return
-    log.info("voice from %s: %s", message.from_user.id, text)
-    await answer(message, text)
+    if message.caption:
+        text = f"{message.caption}\n{text}"
+    log.info("voice from %s (%s, %ss): %s", message.from_user.id, lang, duration, text)
+    await answer(message, text, lang_hint=lang)
 
 
 @dp.message(F.photo | F.document | F.video | F.sticker)
@@ -196,6 +212,10 @@ async def main() -> None:
     log.info("1C reachable: %s", await onec.ping())
     if tts:
         await asyncio.to_thread(tts.warmup)
+    if translator:
+        await asyncio.to_thread(translator.warmup)
+    else:
+        log.info("Translator not installed: Tajik/Uzbek messages get Russian replies")
     me = await bot.get_me()
     log.info("Bot @%s started", me.username)
     try:

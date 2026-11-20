@@ -1,7 +1,8 @@
-"""Voice: text-to-speech for replies and speech-to-text for incoming voice notes.
+"""Voice: text-to-speech for replies and speech-to-text for incoming voice notes / audio files.
 
 TTS engines (all MIT-licensed, commercial use allowed):
 - "silero"     Silero v5 CIS (CPU, ~90 MB): Russian, Tajik, Uzbek female voices. Russian stress by silero-stress.
+               Emotions are rendered with SSML prosody (speed, pitch) and natural pauses.
 - "chatterbox" Chatterbox Multilingual (GPU, ~3 GB): Russian, English, Chinese and others, optional voice cloning.
 Default: Silero for ru/tg/uz, Chatterbox (if installed) for other languages.
 STT: faster-whisper. Heavy libraries are imported lazily so the bot still runs text-only without them.
@@ -11,56 +12,33 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
-import re
+import random
 import threading
-from pathlib import Path
+from xml.sax.saxutils import escape
 
-from .agent import user_language
 from .config import ROOT, settings
 
 log = logging.getLogger(__name__)
-
-URL_RE = re.compile(r"(https?://\S+|t\.me/\S+|\b[\w.-]+\.(?:tj|com|ru)\S*)", re.I)
-EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF☀-➿️‍]+")
 
 SILERO_URL = "https://models.silero.ai/models/tts/ru/v5_cis_base_nostress.pt"
 SILERO_PATH = ROOT / "models" / "v5_cis_base_nostress.pt"
 SILERO_SPEAKERS = {"ru": settings.tts_speaker_ru, "tg": settings.tts_speaker_tg, "uz": settings.tts_speaker_uz}
 SILERO_SR = 48000
 
+# emotion -> (speech rate, pitch, pause after in seconds)
+PROSODY = {
+    "радость": ("fast", "high", 0.28),
+    "воодушевление": ("medium", "high", 0.3),
+    "тепло": ("medium", "medium", 0.32),
+    "сочувствие": ("slow", "low", 0.45),
+    "вопрос": ("medium", "high", 0.4),
+    "спокойно": ("medium", "medium", 0.32),
+}
+# emotion -> Chatterbox exaggeration
+EXAGGERATION = {"радость": 0.8, "воодушевление": 0.75, "тепло": 0.55, "сочувствие": 0.35, "вопрос": 0.55,
+                "спокойно": 0.45}
 
-def basic_clean(text: str) -> str:
-    text = URL_RE.sub("", text)
-    text = EMOJI_RE.sub("", text)
-    text = re.sub(r"[*_`#>|~«»\"]", "", text)
-    text = re.sub(r"\(\s*\)", "", text)
-    text = text.replace("—", ",").replace("–", ",")
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def digits_to_words(text: str, lang: str) -> str:
-    """Safety net for numbers the spoken rewrite missed (Silero can't read digits)."""
-    try:
-        from num2words import num2words
-    except ImportError:
-        return text
-    nlang = {"ru": "ru", "tg": "ru", "uz": "ru", "en": "en"}.get(lang, "en")
-    text = re.sub(r"(\d+)\s*%", lambda m: f"{m.group(1)} " + ("процентов" if nlang == "ru" else "percent"), text)
-    return re.sub(r"\d+", lambda m: num2words(int(m.group()), lang=nlang), text)
-
-
-def split_sentences(text: str, max_len: int = 220) -> list[str]:
-    out: list[str] = []
-    for p in re.split(r"(?<=[.!?…])\s+", text):
-        p = p.strip()
-        while len(p) > max_len:  # split long sentences on commas
-            cut = p.rfind(",", 0, max_len)
-            cut = cut if cut > 40 else max_len
-            out.append(p[: cut + 1].strip())
-            p = p[cut + 1:].strip()
-        if p:
-            out.append(p)
-    return out
+Segments = list[tuple[str, str]]  # [(emotion, sentence)]
 
 
 def _encode_ogg(pieces: list, sr: int) -> bytes:
@@ -75,10 +53,10 @@ def _encode_ogg(pieces: list, sr: int) -> bytes:
     return buf.getvalue()
 
 
-def _pause(sr: int, i: int):
+def _silence(sr: int, seconds: float):
     import numpy as np
 
-    return np.zeros(int(sr * (0.22 if i % 2 else 0.3)), dtype="float32")
+    return np.zeros(int(sr * seconds * random.uniform(0.85, 1.2)), dtype="float32")
 
 
 class SileroEngine:
@@ -106,14 +84,18 @@ class SileroEngine:
             log.info("Silero TTS loaded")
         return self._model
 
-    def synth(self, text: str, lang: str) -> bytes:
+    def synth(self, segments: Segments, lang: str) -> bytes:
         model = self._load()
-        pieces = []
-        for i, sentence in enumerate(split_sentences(text)):
-            if lang == "ru":
-                sentence = self._accentor(sentence)
-            wav = model.apply_tts(text=sentence, speaker=SILERO_SPEAKERS[lang], sample_rate=SILERO_SR)
-            pieces += [wav.numpy(), _pause(SILERO_SR, i)]
+        pieces = [_silence(SILERO_SR, 0.12)]
+        for emotion, sentence in segments:
+            text = self._accentor(sentence) if lang == "ru" else sentence
+            rate, pitch, pause = PROSODY.get(emotion, PROSODY["тепло"])
+            ssml = f"<speak><prosody rate='{rate}' pitch='{pitch}'>{escape(text)}</prosody></speak>"
+            try:
+                wav = model.apply_tts(ssml_text=ssml, speaker=SILERO_SPEAKERS[lang], sample_rate=SILERO_SR)
+            except Exception:  # noqa: BLE001 - fall back to plain text if SSML is rejected
+                wav = model.apply_tts(text=text, speaker=SILERO_SPEAKERS[lang], sample_rate=SILERO_SR)
+            pieces += [wav.numpy(), _silence(SILERO_SR, pause)]
         return _encode_ogg(pieces, SILERO_SR)
 
 
@@ -132,7 +114,7 @@ class ChatterboxEngine:
         except ImportError:
             return False
 
-    def synth(self, text: str, lang: str) -> bytes:
+    def synth(self, segments: Segments, lang: str) -> bytes:
         import torch
 
         if self._model is None:
@@ -142,13 +124,14 @@ class ChatterboxEngine:
             log.info("Loading Chatterbox Multilingual on %s…", device)
             self._model = ChatterboxMultilingualTTS.from_pretrained(device=device)
         sr = self._model.sr
-        kwargs = dict(language_id=lang, exaggeration=settings.tts_exaggeration, cfg_weight=settings.tts_cfg_weight)
-        if settings.tts_voice_ref:
-            kwargs["audio_prompt_path"] = settings.tts_voice_ref
         pieces = []
-        for i, sentence in enumerate(split_sentences(text)):
+        for emotion, sentence in segments:
+            kwargs = dict(language_id=lang, exaggeration=EXAGGERATION.get(emotion, settings.tts_exaggeration),
+                          cfg_weight=settings.tts_cfg_weight)
+            if settings.tts_voice_ref:
+                kwargs["audio_prompt_path"] = settings.tts_voice_ref
             wav = self._model.generate(sentence, **kwargs).squeeze(0).detach().cpu().numpy()
-            pieces += [wav, _pause(sr, i)]
+            pieces += [wav, _silence(sr, PROSODY.get(emotion, PROSODY["тепло"])[2])]
         return _encode_ogg(pieces, sr)
 
 
@@ -166,26 +149,28 @@ class TTS:
             return self.silero
         return None
 
+    def supports(self, lang: str) -> bool:
+        return self._engine(lang) is not None
+
     def warmup(self) -> None:
         try:
-            self._synth_sync("Привет!", "ru")
+            self._synth_sync([("радость", "Привет!")], "ru")
         except Exception:  # noqa: BLE001
             log.exception("TTS warmup failed (voice replies disabled until fixed)")
 
-    def _synth_sync(self, text: str, lang: str) -> bytes | None:
+    def _synth_sync(self, segments: Segments, lang: str) -> bytes | None:
         engine = self._engine(lang)
         if engine is None:
             log.info("no TTS voice for language %s, skipping voice reply", lang)
             return None
         with self._lock:
-            return engine.synth(text, lang)
+            return engine.synth(segments, lang)
 
-    async def synthesize(self, spoken_text: str) -> bytes | None:
-        lang = user_language(spoken_text)
-        text = digits_to_words(basic_clean(spoken_text), lang)
-        if not text:
+    async def synthesize(self, segments: Segments, lang: str) -> bytes | None:
+        segments = [(e, s) for e, s in segments if s.strip()]
+        if not segments:
             return None
-        return await asyncio.to_thread(self._synth_sync, text, lang)
+        return await asyncio.to_thread(self._synth_sync, segments, lang)
 
 
 class STT:
@@ -193,7 +178,7 @@ class STT:
         self._model = None
         self._lock = threading.Lock()
 
-    def _transcribe_sync(self, data: bytes) -> str:
+    def _transcribe_sync(self, data: bytes) -> tuple[str, str]:
         with self._lock:
             if self._model is None:
                 from faster_whisper import WhisperModel
@@ -202,8 +187,10 @@ class STT:
                 compute = "float16" if device == "cuda" else "int8"
                 log.info("Loading faster-whisper %s on %s (%s)…", settings.stt_model, device, compute)
                 self._model = WhisperModel(settings.stt_model, device=device, compute_type=compute)
-            segments, _info = self._model.transcribe(io.BytesIO(data), beam_size=5, vad_filter=True)
-            return " ".join(s.text.strip() for s in segments).strip()
+            segments, info = self._model.transcribe(io.BytesIO(data), beam_size=5, vad_filter=True)
+            text = " ".join(s.text.strip() for s in segments).strip()
+            return text, info.language
 
-    async def transcribe(self, data: bytes) -> str:
+    async def transcribe(self, data: bytes) -> tuple[str, str]:
+        """Returns (text, detected language code)."""
         return await asyncio.to_thread(self._transcribe_sync, data)
