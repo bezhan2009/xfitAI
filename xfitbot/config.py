@@ -35,6 +35,10 @@ class Settings:
     # languages the LLM may answer in; others get Russian (qwen2.5:7b can't write Tajik/Uzbek well)
     reply_languages: frozenset = frozenset(os.getenv("REPLY_LANGUAGES", "ru,en,zh").replace(" ", "").split(","))
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.4"))
+    llm_num_ctx: int = int(os.getenv("LLM_NUM_CTX", "8192"))
+    # layers of the LLM on the GPU: 99 = all (fastest, no CPU load; needs ~4.7 GB VRAM for qwen2.5:7b),
+    # -1 = let Ollama decide (it keeps a large safety margin and on a 6 GB card leaves 4 layers on the CPU)
+    llm_num_gpu: int = int(os.getenv("LLM_NUM_GPU", "99"))
     # languages answered via the local translator (LLM answers in Russian, TranslateGemma translates)
     translate_languages: frozenset = frozenset(os.getenv("TRANSLATE_LANGUAGES", "tg,uz").replace(" ", "").split(","))
     mt_model: str = os.getenv("MT_MODEL", "translategemma:4b")
@@ -54,7 +58,7 @@ class Settings:
 
     stt_enabled: bool = _bool("STT_ENABLED", True)
     stt_model: str = os.getenv("STT_MODEL", "small")
-    stt_device: str = os.getenv("STT_DEVICE", "cpu")
+    stt_device: str = os.getenv("STT_DEVICE", "cuda")
 
     data_dir: Path = ROOT / "data"
     timezone: str = os.getenv("TZ_NAME", "Asia/Dushanbe")

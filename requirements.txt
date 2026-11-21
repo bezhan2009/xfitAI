@@ -5,8 +5,10 @@ num2words>=0.5.13
 tzdata
 numpy
 soundfile>=0.12
-# voice: install torch first (CPU build is enough for Silero):
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# voice: install a CUDA build of torch first (or reuse a conda env that has one, see README):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
 silero-stress>=1.5
-faster-whisper>=1.1
+openai-whisper>=20250625   # speech-to-text on the GPU (PyTorch)
+imageio-ffmpeg>=0.5        # bundled ffmpeg for decoding voice notes / mp3 / m4a (skip if ffmpeg is on PATH)
+# CPU-only machines: faster-whisper>=1.1 instead of openai-whisper (STT_DEVICE=cpu)
 # optional, GPU, ~3 GB:  chatterbox-tts

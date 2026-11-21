@@ -1,11 +1,13 @@
 """Voice: text-to-speech for replies and speech-to-text for incoming voice notes / audio files.
 
 TTS engines (all MIT-licensed, commercial use allowed):
-- "silero"     Silero v5 CIS (CPU, ~90 MB): Russian, Tajik, Uzbek female voices. Russian stress by silero-stress.
+- "silero"     Silero v5 CIS (~90 MB, GPU if available): Russian, Tajik, Uzbek female voices. Russian stress by
+               silero-stress.
                Emotions are rendered with SSML prosody (speed, pitch) and natural pauses.
 - "chatterbox" Chatterbox Multilingual (GPU, ~3 GB): Russian, English, Chinese and others, optional voice cloning.
 Default: Silero for ru/tg/uz, Chatterbox (if installed) for other languages.
-STT: faster-whisper. Heavy libraries are imported lazily so the bot still runs text-only without them.
+STT: OpenAI Whisper on the GPU (PyTorch, fp16); faster-whisper on the CPU as fallback. Heavy libraries are imported
+lazily so the bot still runs text-only without them.
 """
 from __future__ import annotations
 
@@ -13,7 +15,11 @@ import asyncio
 import io
 import logging
 import random
+import shutil
+import subprocess
+import tempfile
 import threading
+from pathlib import Path
 from xml.sax.saxutils import escape
 
 from .config import ROOT, settings
@@ -59,6 +65,26 @@ def _silence(sr: int, seconds: float):
     return np.zeros(int(sr * seconds * random.uniform(0.85, 1.2)), dtype="float32")
 
 
+def _torch_device(wanted: str) -> str:
+    """'cuda' when asked for and a CUDA GPU is usable, else 'cpu'."""
+    if wanted.startswith("cuda"):
+        import torch
+
+        if torch.cuda.is_available():
+            return wanted
+        log.warning("%s requested but PyTorch has no CUDA (CPU build?), using CPU", wanted)
+    return "cpu"
+
+
+def _free_cuda_cache() -> None:
+    """Give PyTorch's cached VRAM back so Ollama keeps the whole LLM on the GPU."""
+    import sys
+
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 class SileroEngine:
     languages = {"ru", "tg", "uz"}
 
@@ -76,12 +102,13 @@ class SileroEngine:
                 torch.hub.download_url_to_file(SILERO_URL, str(SILERO_PATH))
             torch.set_num_threads(4)
             model = torch.package.PackageImporter(str(SILERO_PATH)).load_pickle("tts_models", "model")
-            model.to(torch.device("cpu"))
+            self.device = _torch_device(settings.tts_device)
+            model.to(self.device)
             from silero_stress import load_accentor
 
             self._accentor = load_accentor()
             self._model = model  # set last, so a failed load is retried next time
-            log.info("Silero TTS loaded")
+            log.info("Silero TTS loaded on %s", self.device)
         return self._model
 
     def synth(self, segments: Segments, lang: str) -> bytes:
@@ -95,7 +122,7 @@ class SileroEngine:
                 wav = model.apply_tts(ssml_text=ssml, speaker=SILERO_SPEAKERS[lang], sample_rate=SILERO_SR)
             except Exception:  # noqa: BLE001 - fall back to plain text if SSML is rejected
                 wav = model.apply_tts(text=text, speaker=SILERO_SPEAKERS[lang], sample_rate=SILERO_SR)
-            pieces += [wav.numpy(), _silence(SILERO_SR, pause)]
+            pieces += [wav.detach().cpu().numpy(), _silence(SILERO_SR, pause)]
         return _encode_ogg(pieces, SILERO_SR)
 
 
@@ -164,7 +191,10 @@ class TTS:
             log.info("no TTS voice for language %s, skipping voice reply", lang)
             return None
         with self._lock:
-            return engine.synth(segments, lang)
+            try:
+                return engine.synth(segments, lang)
+            finally:
+                _free_cuda_cache()
 
     async def synthesize(self, segments: Segments, lang: str) -> bytes | None:
         segments = [(e, s) for e, s in segments if s.strip()]
@@ -173,23 +203,106 @@ class TTS:
         return await asyncio.to_thread(self._synth_sync, segments, lang)
 
 
+def _ffmpeg() -> str | None:
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _decode_16k(data: bytes):
+    """Any audio/video container Telegram sends (ogg/opus, mp3, m4a, mp4 round videos…) -> 16 kHz mono float32."""
+    import numpy as np
+
+    exe = _ffmpeg()
+    if exe is None:
+        raise RuntimeError("ffmpeg not found (install ffmpeg or `pip install imageio-ffmpeg`)")
+    # a temp file, not a pipe: m4a/mp4 often keep their index at the end and need a seekable input
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "in.bin"
+        src.write_bytes(data)
+        out = subprocess.run([exe, "-nostdin", "-loglevel", "error", "-i", str(src), "-f", "s16le", "-ac", "1",
+                              "-ar", "16000", "pipe:1"], capture_output=True, check=True,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return np.frombuffer(out.stdout, np.int16).astype(np.float32) / 32768.0
+
+
+def _half_except_layernorm(model) -> None:
+    """Whisper keeps fp32 weights and casts per call; store them in fp16 instead (LayerNorms stay fp32 as Whisper
+    computes them in fp32)."""
+    import torch
+
+    for module in model.modules():
+        if isinstance(module, torch.nn.LayerNorm):
+            continue
+        for p in module.parameters(recurse=False):
+            p.data = p.data.half()
+        for name, b in module.named_buffers(recurse=False):
+            if b.is_floating_point():
+                setattr(module, name, b.half())
+
+
 class STT:
+    """OpenAI Whisper on the GPU (fp16) when CUDA PyTorch is available, otherwise faster-whisper int8 on the CPU."""
+
     def __init__(self) -> None:
         self._model = None
+        self._backend = ""
         self._lock = threading.Lock()
+
+    def _load(self) -> None:
+        device = _torch_device(settings.stt_device)
+        if device != "cpu":
+            try:
+                import whisper
+
+                root = ROOT / "models" / "whisper"
+                log.info("Loading Whisper %s on %s (fp16)…", settings.stt_model, device)
+                model = whisper.load_model(settings.stt_model, device="cpu", download_root=str(root))
+                _half_except_layernorm(model)  # fp16 weights: half the VRAM, the 7B LLM must fit next to it
+                self._model = model.to(device)
+                self._backend = "whisper"
+                return
+            except ImportError:
+                log.warning("openai-whisper not installed, falling back to faster-whisper on CPU")
+        from faster_whisper import WhisperModel
+
+        log.info("Loading faster-whisper %s on cpu (int8)…", settings.stt_model)
+        self._model = WhisperModel(settings.stt_model, device="cpu", compute_type="int8")
+        self._backend = "faster"
 
     def _transcribe_sync(self, data: bytes) -> tuple[str, str]:
         with self._lock:
             if self._model is None:
-                from faster_whisper import WhisperModel
-
-                device = settings.stt_device
-                compute = "float16" if device == "cuda" else "int8"
-                log.info("Loading faster-whisper %s on %s (%s)…", settings.stt_model, device, compute)
-                self._model = WhisperModel(settings.stt_model, device=device, compute_type=compute)
+                self._load()
+            if self._backend == "whisper":
+                try:
+                    res = self._model.transcribe(_decode_16k(data), fp16=True, beam_size=5,
+                                                 condition_on_previous_text=False)
+                finally:
+                    _free_cuda_cache()
+                return res["text"].strip(), res.get("language") or ""
             segments, info = self._model.transcribe(io.BytesIO(data), beam_size=5, vad_filter=True)
             text = " ".join(s.text.strip() for s in segments).strip()
             return text, info.language
+
+    def warmup(self) -> None:
+        try:
+            with self._lock:
+                if self._model is None:
+                    self._load()
+                if self._backend == "whisper":  # first GPU run compiles kernels (~15 s); do it before clients wait
+                    import numpy as np
+
+                    self._model.transcribe(np.zeros(16000, dtype="float32"), fp16=True, language="ru")
+                    _free_cuda_cache()
+        except Exception:  # noqa: BLE001
+            log.exception("STT warmup failed (voice messages will be forwarded as text-less)")
 
     async def transcribe(self, data: bytes) -> tuple[str, str]:
         """Returns (text, detected language code)."""

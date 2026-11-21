@@ -73,6 +73,7 @@ async def on_mode(message: Message) -> None:
         _client_view.add(uid)
         await message.answer("Режим клиента: бот отвечает вам как обычному клиенту. /mode — вернуться.")
     store.get(uid).history.clear()
+    store.save(store.get(uid))
 
 
 async def human_pause(text: str) -> None:
@@ -119,6 +120,7 @@ async def send_voice(message: Message, reply: str, lang: str = "ru") -> None:
 async def on_start(message: Message) -> None:
     st = store.get(message.from_user.id, message.from_user.first_name or "")
     st.history.clear()
+    store.save(st)
     name = message.from_user.first_name or ""
     greet = (f"Здравствуйте{', ' + name if name else ''}! Я Алина, ассистент клуба X-Fit Premium Dushanbe 😊 "
              "Расскажу о клубе, картах и помогу записаться на бесплатный тур. А если вы уже член клуба — "
@@ -130,7 +132,9 @@ async def on_start(message: Message) -> None:
 
 @dp.message(Command("reset"))
 async def on_reset(message: Message) -> None:
-    store.get(message.from_user.id).history.clear()
+    st = store.get(message.from_user.id)
+    st.history.clear()
+    store.save(st)
     await message.answer("Начнём сначала 🙂 Чем могу помочь?")
 
 
@@ -212,6 +216,8 @@ async def main() -> None:
     log.info("1C reachable: %s", await onec.ping())
     if tts:
         await asyncio.to_thread(tts.warmup)
+    if stt:
+        await asyncio.to_thread(stt.warmup)
     if translator:
         await translator.warmup()
     else:

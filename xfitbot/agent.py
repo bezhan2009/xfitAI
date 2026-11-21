@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 
 KNOWLEDGE = (Path(__file__).parent / "knowledge.md").read_text("utf-8")
 MAX_HISTORY = 16
+HISTORY_TTL = 12 * 3600  # seconds a saved conversation is resumed after a restart
 MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
           "сентября", "октября", "ноября", "декабря"]
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
@@ -39,6 +40,7 @@ SYSTEM_PROMPT = """Ты — Алина, ассистент фитнес-клуб
 - Отвечай ТОЛЬКО по базе знаний и по блоку «ДАННЫЕ КЛИЕНТА ИЗ 1С». Ничего не выдумывай: ни цен, ни дат, ни тарифов, ни акций, ни расписания, ни условий. Если в данных чего-то нет — так и скажи и предложи уточнить у менеджера.
 - Про абонемент клиента говори только то, что есть в блоке «ДАННЫЕ КЛИЕНТА ИЗ 1С». Если блока нет — у тебя НЕТ данных о его карте: попроси написать номер телефона, на который оформлена карта (+992…), или нажать кнопку «📱 Поделиться номером».
 - Поиск по номеру делает система, результат придёт в пометке [Поиск в 1С …]. НИКОГДА не говори, что клиента нет в базе, если такой пометки нет.
+- «Какие у вас (у тебя) есть абонементы / карты / тарифы?» — это вопрос о том, что предлагает КЛУБ: расскажи о видах карт из базы знаний. Про карту самого клиента говори, только если он спрашивает именно о своей («моя карта», «мой абонемент», «до какого числа»).
 - Заморозка: возможна только в пределах «дней_заморозки_по_тарифу». Если там 0 — по тарифу заморозка не предусмотрена. Саму заморозку, продление, переоформление, запись на тур оформляет менеджер, не ты.
 - Тур: когда клиент назвал день и примерное время (с 9:00 до 21:00) — вызови handoff_to_manager с summary и скажи, что передала менеджеру, он подтвердит время в этом чате. Если назвал только день — спроси время двумя вариантами.
 - Жалоба, возврат, скидка, мед. вопрос, просьба позвать человека, нет ответа в базе — вызови handoff_to_manager.
@@ -64,7 +66,8 @@ STAFF_NOTE = """Собеседник — сотрудник клуба (режи
 Отвечай точно цифрами, кратко, можно списком. Правила про тур и вопрос «сегодня или завтра» к сотруднику не применяй."""
 
 
-HANDOFF_RE = re.compile(r"(передала|передаю|уже передал|менеджер (свяжется|подтвердит|подключится|ответит)|"
+# "менеджер подтвердит" is not here: the model says it while still asking for the time
+HANDOFF_RE = re.compile(r"(передала|передаю|уже передал|менеджер (свяжется|подключится|ответит)|"
                         r"passed (it|this|your).{0,30} manager|manager will (contact|confirm|reply))", re.I)
 
 LANG_NAMES = {"ru": "русский", "en": "английский (English)", "tg": "таджикский (тоҷикӣ)",
@@ -84,6 +87,13 @@ TAJIK_VERB_RE = re.compile(r"(на)?ме(фахм|хох|кун|шав|дон|б
                            r"\w*(ам|ӣ|и|ад|ем|ед|анд|ид)")
 
 
+# Tajik / Muslim greetings and common Tajik words typed in Latin letters (phones without a Cyrillic keyboard)
+TAJIK_LATIN_GREETING_RE = re.compile(r"(as+al[ao]m(u|y)?|as+alom(u)?|s[ao]l[ao]m|al[ae][iy]?kum|vaal[ae][iy]?kum)")
+TAJIK_LATIN = {"chiz", "shumo", "hast", "nest", "chand", "narx", "narkh", "mekhoham", "mexoham", "mekhostam",
+               "rahmat", "rakhmat", "tashakur", "tashakkur", "lutfan", "kadom", "kujo", "imruz", "pagoh", "khub",
+               "bale", "korti", "dored", "doram", "kardan", "metavonam", "metavonad"}
+
+
 def user_language(text: str) -> str:
     if re.search(r"[一-鿿]", text):
         return "zh"
@@ -100,6 +110,11 @@ def user_language(text: str) -> str:
     if lat > cyr:
         if re.search(r"(o'|g'|\bsalom\b|\brahmat\b|\bqancha\b|\bmen\b|\bsiz\b)", text, re.I):
             return "uz"
+        lwords = re.findall(r"[a-z']+", text.lower())
+        greet = any(TAJIK_LATIN_GREETING_RE.fullmatch(w) for w in lwords)
+        tj = sum(1 for w in lwords if w in TAJIK_LATIN)
+        if tj >= 2 or (greet and len(lwords) <= 3):  # "Assalam", "salam aleykum", "narxi chand, lutfan"
+            return "tg"
         return "en"
     return "ru"
 
@@ -142,7 +157,23 @@ def relevant_facts(text: str) -> str:
     return "\n".join(picked)[:2500]
 
 
+# tour request in the recent dialog + the client names a time -> always hand off (the model often forgets the tool)
+TOUR_CTX_RE = re.compile(r"(тур|экскурси|посмотреть клуб|\btour\b)", re.I)
+TOUR_TIME_RE = re.compile(r"(\b([01]?\d|2[0-3])[:.][0-5]\d\b|\b(в|к|около|после|at|after)\s+([1-9]|1\d|2[0-1])\b|утр|днём|днем|"
+                          r"обед|вечер|morning|afternoon|evening|\b\d{1,2}\s*(am|pm)\b)", re.I)
+TOUR_DONE = {
+    "ru": "Отлично, передала менеджеру ваше пожелание по времени 🙂 Он подтвердит тур здесь, в этом чате.",
+    "en": "Great, I've passed your preferred time to the manager 🙂 They'll confirm the tour right here in this chat.",
+}
+# the assistant never knows that a manager confirmed anything
+FALSE_CONFIRM_RE = re.compile(r"[Мм]енеджер(\s+уже)?\s+подтвердил[аи]?(\s+время)?")
 TOUR_Q_RE = re.compile(r"\s*Вам удобнее (заглянуть )?сегодня вечером или завтра днём[^?]*\?\s*$")
+
+
+def _recent_dialog(st: "UserState", n: int = 6) -> str:
+    """Last messages of the chat for the manager's hand-off note."""
+    return "\n".join(f"{'Клиент' if m['role'] == 'user' else 'Алина'}: {m['content']}"
+                     for m in st.history[-n:] if not m["content"].startswith("[Системное"))
 
 
 def tidy_answer(answer: str, st: "UserState") -> str:
@@ -153,6 +184,9 @@ def tidy_answer(answer: str, st: "UserState") -> str:
         if st.client_key or "?" in before:
             answer = before.rstrip()
     answer = re.sub(r"(?i)(?<=\w)assistant\s*:\s*", "", answer)  # stray role token glued into text by the model
+    answer = FALSE_CONFIRM_RE.sub("Менеджер подтвердит время", answer)
+    # the model sometimes imitates the system's notes ("[Поиск в 1С показал …]"); a chat reply never needs them
+    answer = re.sub(r"\s*\[[^\[\]]{15,}\]", "", answer)
     return re.sub(r"\n{3,}", "\n\n", answer).strip()
 
 
@@ -198,6 +232,14 @@ def _humanize(obj: Any) -> Any:
     return obj
 
 
+def llm_options(**extra) -> dict:
+    """Ollama options. Every call must use the same num_ctx / num_gpu, otherwise Ollama reloads the model."""
+    opts = {"num_ctx": settings.llm_num_ctx}
+    if settings.llm_num_gpu >= 0:
+        opts["num_gpu"] = settings.llm_num_gpu  # 99 = all layers on the GPU (Ollama's own estimate is too careful)
+    return {**opts, **extra}
+
+
 @dataclass
 class UserState:
     user_id: int
@@ -211,10 +253,12 @@ class UserState:
     reply_lang: str = "ru"  # language of the text actually sent to the user
     client_data: str | None = None
     client_data_at: float = 0.0
+    handoff_at: float = 0.0  # last time the dialog was passed to a manager (no duplicate alerts)
 
 
 class UserStore:
-    """Tiny JSON store for verified phones (no chat history on disk)."""
+    """Tiny JSON store: verified phones and the last messages of each chat (kept HISTORY_TTL, so a bot restart
+    doesn't make Alina forget what the client just said). Local file, git-ignored."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -227,13 +271,19 @@ class UserStore:
             saved = self._data.get(str(user_id), {})
             st = UserState(user_id=user_id, first_name=first_name, phone=saved.get("phone"),
                            client_key=saved.get("client_key"), client_name=saved.get("client_name"))
+            if time.time() - saved.get("history_at", 0) < HISTORY_TTL:  # survive bot restarts
+                st.history = list(saved.get("history") or [])[-MAX_HISTORY:]
+                st.language = saved.get("language", "ru")
+                st.reply_lang = saved.get("reply_lang", "ru")
             self._live[user_id] = st
         if first_name:
             st.first_name = first_name
         return st
 
     def save(self, st: UserState) -> None:
-        self._data[str(st.user_id)] = {"phone": st.phone, "client_key": st.client_key, "client_name": st.client_name}
+        self._data[str(st.user_id)] = {"phone": st.phone, "client_key": st.client_key, "client_name": st.client_name,
+                                       "history": st.history[-MAX_HISTORY:], "history_at": time.time(),
+                                       "language": st.language, "reply_lang": st.reply_lang}
         self.path.write_text(json.dumps(self._data, ensure_ascii=False, indent=1), "utf-8")
 
 
@@ -368,10 +418,13 @@ class Agent:
         r = await self.http.post("/api/chat", json={
             "model": settings.llm_model, "messages": messages, "tools": tools, "stream": False,
             "keep_alive": "60m",
-            "options": {"temperature": settings.llm_temperature, "num_ctx": 8192, "top_p": 0.9},
+            "options": llm_options(temperature=settings.llm_temperature, top_p=0.9),
         })
         r.raise_for_status()
-        return r.json()["message"]
+        data = r.json()
+        log.info("llm: prompt %s tok, answer %s tok, %.1f s", data.get("prompt_eval_count"), data.get("eval_count"),
+                 (data.get("total_duration") or 0) / 1e9)
+        return data["message"]
 
     async def spoken_version(self, text: str, lang: str = "ru") -> list[tuple[str, str]]:
         """Turn a chat reply into voice segments [(emotion, sentence)].
@@ -401,7 +454,7 @@ class Agent:
             r = await self.http.post("/api/chat", json={
                 "model": settings.llm_model, "stream": False, "keep_alive": "60m",
                 "messages": [{"role": "user", "content": prompt}],
-                "options": {"temperature": 0.4, "num_ctx": 4096},
+                "options": llm_options(temperature=0.4),
             })
             r.raise_for_status()
             out = r.json()["message"].get("content") or ""
@@ -431,7 +484,10 @@ class Agent:
     async def reply(self, st: UserState, text: str, is_staff: bool = False, lang_hint: str | None = None) -> str:
         tools = CLIENT_TOOLS + (STAFF_TOOLS if is_staff else [])
         if not text.startswith("[Системное"):
-            lang = lang_hint if lang_hint in LANG_NAMES else user_language(text)
+            # Whisper's language guess is unreliable for short clips ("Assalam" -> pt/en), so Tajik/Uzbek words in
+            # the text win over it
+            detected = user_language(text)
+            lang = detected if detected in ("tg", "uz", "zh") or lang_hint not in LANG_NAMES else lang_hint
             if lang in settings.translate_languages and self.translator:
                 # the LLM can't write Tajik/Uzbek well: it reads and answers in Russian, the translator does the rest
                 original = text
@@ -522,12 +578,21 @@ class Agent:
             answer = ((await self._chat(messages, []))).get("content", "").strip() or answer
             answer = re.sub(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]+", "", answer).strip()
         answer = tidy_answer(answer, st)
+        if (not is_staff and not handed_off and self.notify_manager and not text.startswith("[Системное")
+                and TOUR_TIME_RE.search(text) and any(TOUR_CTX_RE.search(m["content"]) for m in st.history[-5:])):
+            log.info("tour time named, handing off to manager")
+            await self.notify_manager(st, "запись на бесплатный тур", _recent_dialog(st))
+            handed_off = True
+            answer = TOUR_DONE.get(st.language, TOUR_DONE["ru"])
         st.history.append({"role": "assistant", "content": answer})
-        if not handed_off and self.notify_manager and HANDOFF_RE.search(answer):
+        self.store.save(st)
+        if (not handed_off and self.notify_manager and HANDOFF_RE.search(answer)
+                and time.time() - st.handoff_at > 600):  # "я уже передала" right after a hand-off: no second alert
             # the model said it passed the dialog on but didn't call the tool: do it anyway
-            convo = "\n".join(f"{'Клиент' if m['role'] == 'user' else 'Алина'}: {m['content']}"
-                              for m in st.history[-6:] if not m["content"].startswith("[Системное"))
-            await self.notify_manager(st, "ассистент передал диалог", convo)
+            await self.notify_manager(st, "ассистент передал диалог", _recent_dialog(st))
+            handed_off = True
+        if handed_off:
+            st.handoff_at = time.time()
         if st.reply_lang in settings.translate_languages and self.translator and st.reply_lang != st.language:
             try:
                 translated = await self.translator.translate(answer, st.reply_lang)

@@ -99,15 +99,17 @@ def _digits_grouped(digits: str, lang: str, original: str = "") -> str:
 
 HOURS_GEN = ["", "часа", "двух", "трёх", "четырёх", "пяти", "шести", "семи", "восьми", "девяти", "десяти",
              "одиннадцати", "двенадцати"]
+# dative, after "к": "к шести вечера", "к часу дня"
+HOURS_DAT = ["", "часу", "двум", "трём", "четырём"] + HOURS_GEN[5:]
 
 
-def _time_words(h: int, mi: int, lang: str, genitive: bool = False) -> str:
+def _time_words(h: int, mi: int, lang: str, genitive: bool | str = False) -> str:
     if lang != "ru":
         return cardinal(h, lang) + (" " + cardinal(mi, lang) if mi else "")
     part = "ночи" if h < 5 else "утра" if h < 12 else "дня" if h < 17 else "вечера"
     h12 = h % 12 or 12
-    if genitive and not mi:  # "с девяти утра до девяти вечера"
-        return f"{HOURS_GEN[h12]} {part}"
+    if genitive and not mi:  # "с девяти утра до девяти вечера", "к шести вечера"
+        return f"{(HOURS_DAT if genitive == 'dat' else HOURS_GEN)[h12]} {part}"
     hw = "час" if h12 == 1 else cardinal(h12, "ru")
     return f"{hw}{' ' + cardinal(mi, 'ru') if mi else ''} {part}"
 
@@ -133,6 +135,9 @@ def speakable(text: str, lang: str = "ru") -> str:
         # time after "с/до/от/после/около" takes the genitive
         text = re.sub(r"\b(с|до|от|после|около)\s+([01]?\d|2[0-3]):([0-5]\d)\b",
                       lambda m: f"{m.group(1)} {_time_words(int(m.group(2)), int(m.group(3)), 'ru', True)}", text)
+        # after "к" the dative: "к 18:00" -> "к шести вечера"
+        text = re.sub(r"\b([кК])\s+([01]?\d|2[0-3]):([0-5]\d)\b",
+                      lambda m: f"{m.group(1)} {_time_words(int(m.group(2)), int(m.group(3)), 'ru', 'dat')}", text)
 
     # phones and long IDs: +992 90 882 77 77, 992111553535, 111 55 35 35
     def phone(m: re.Match) -> str:
